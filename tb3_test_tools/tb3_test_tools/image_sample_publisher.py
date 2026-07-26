@@ -17,7 +17,7 @@ class ImageSamplePublisher(Node):
     def __init__(self) -> None:
         super().__init__('image_sample_publisher')
 
-        self.declare_parameter('file_name', 'sample_lane.jpg')
+        self.declare_parameter('file_name', 'sample_camera.jpg')
         self.declare_parameter('output_topic', '/camera/image_raw')
         self.declare_parameter('frame_id', 'camera_link')
         self.declare_parameter('rate_hz', 10.0)

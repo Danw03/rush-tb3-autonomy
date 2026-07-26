@@ -55,7 +55,7 @@ class ScanSamplePublisher(Node):
     def __init__(self) -> None:
         super().__init__('scan_sample_publisher')
 
-        self.declare_parameter('file_name', 'cone_center.yaml')
+        self.declare_parameter('file_name', 'sample_lidar.yaml')
         self.declare_parameter('output_topic', '/scan')
         self.declare_parameter('rate_hz', 10.0)
         self.declare_parameter('frame_id_override', '')

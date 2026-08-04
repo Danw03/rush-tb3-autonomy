@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 import math
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import rclpy
@@ -12,6 +12,130 @@ from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Float32MultiArray, MultiArrayDimension
 from visualization_msgs.msg import Marker, MarkerArray
+
+
+class ConeSideTracker:
+    """콘 좌/우 소속의 프레임 간 이력을 들고, 짧은 반대쪽 판정을 유예한다.
+
+    split_left_right() 는 매 프레임 y 부호만으로 판정하므로, 커브에서
+    바깥쪽 콘의 스윕각이 임계각을 넘으면 그 프레임에서 즉시 반대편으로
+    뒤집힌다(ConePerceptionNode.split_left_right 문서의 "알려진 한계"
+    참고). 이 트래커는 직전까지의 소속을 기억해, 반대쪽 판정이
+    override_grace_s(초) 동안 연속으로 나오지 않으면 이전 소속을 그대로
+    유지시켜 순간적인 뒤집힘을 흡수한다.
+
+    ROS 의존이 전혀 없는 순수 자료구조/로직이라 노드 없이 단위 테스트할
+    수 있다.
+    """
+
+    def __init__(
+        self,
+        match_radius_m: float,
+        override_grace_s: float,
+        missed_timeout_s: float,
+    ) -> None:
+        self.match_radius_m = match_radius_m
+        self.override_grace_s = override_grace_s
+        self.missed_timeout_s = missed_timeout_s
+        self._slots: List[Dict] = []
+
+    def resolve(
+        self,
+        points_xy: np.ndarray,
+        raw_sides: List[Optional[str]],
+        timestamp_s: float,
+    ) -> List[Optional[str]]:
+        """이번 프레임 각 점의 최종 side('L'/'R'/None)를 정하고 이력을 갱신한다.
+
+        raw_sides[i] 는 이번 프레임의 순수 y부호 판정 결과다(데드밴드면 None).
+
+        매칭되는 이전 슬롯이 없으면(방금 시야에 들어온 콘) 원시 판정을
+        그대로 쓴다 - 과거 이력이 없는 콘까지 강제로 어느 쪽에 묶을 이유는
+        없다. 매칭되는 슬롯이 있으면:
+
+          * 원시 판정이 슬롯 소속과 같다 -> 그대로 확정, 불일치 시간 리셋.
+          * 데드밴드(None)라 판단이 없다 -> 슬롯 소속을 그대로 유지하고
+            불일치 시간은 멈춘다(늘지도 줄지도 않음).
+          * 원시 판정이 슬롯 소속과 다르다(반대편) -> 불일치 시간을 누적
+            하고, override_grace_s 를 넘기기 전까지는 슬롯 소속을 유지한다.
+            넘기면 그제서야 반대편으로 확정한다.
+        """
+        n = points_xy.shape[0]
+
+        # 점 <-> 슬롯 매칭: 거리순 그리디. 슬롯 하나가 여러 점에, 점 하나가
+        # 여러 슬롯에 매칭되는 걸 막는다.
+        candidates = []
+        for i in range(n):
+            for j, slot in enumerate(self._slots):
+                d = float(np.hypot(*(points_xy[i] - slot["xy"])))
+                if d <= self.match_radius_m:
+                    candidates.append((d, i, j))
+        candidates.sort(key=lambda item: item[0])
+
+        point_to_slot: Dict[int, int] = {}
+        used_slots = set()
+        for _, i, j in candidates:
+            if i in point_to_slot or j in used_slots:
+                continue
+            point_to_slot[i] = j
+            used_slots.add(j)
+
+        effective: List[Optional[str]] = [None] * n
+        new_slots: List[Dict] = []
+
+        for i in range(n):
+            raw = raw_sides[i]
+
+            if i not in point_to_slot:
+                effective[i] = raw
+                if raw is not None:
+                    new_slots.append(
+                        {
+                            "xy": points_xy[i].copy(),
+                            "side": raw,
+                            "disagree_s": 0.0,
+                            "last_seen_s": timestamp_s,
+                        }
+                    )
+                continue
+
+            slot = self._slots[point_to_slot[i]]
+
+            if raw is None:
+                side = slot["side"]
+                disagree_s = slot["disagree_s"]
+            elif raw == slot["side"]:
+                side = raw
+                disagree_s = 0.0
+            else:
+                dt = max(timestamp_s - slot["last_seen_s"], 0.0)
+                disagree_s = slot["disagree_s"] + dt
+                if disagree_s >= self.override_grace_s:
+                    side = raw
+                    disagree_s = 0.0
+                else:
+                    side = slot["side"]
+
+            effective[i] = side
+            new_slots.append(
+                {
+                    "xy": points_xy[i].copy(),
+                    "side": side,
+                    "disagree_s": disagree_s,
+                    "last_seen_s": timestamp_s,
+                }
+            )
+
+        # 이번 프레임에 매칭 안 된 기존 슬롯: missed_timeout_s 안이면 다음
+        # 프레임에서도 계속 매칭 대상으로 남긴다(잠깐 안 보인 것일 수 있음).
+        for j, slot in enumerate(self._slots):
+            if j in used_slots:
+                continue
+            if timestamp_s - slot["last_seen_s"] <= self.missed_timeout_s:
+                new_slots.append(slot)
+
+        self._slots = new_slots
+        return effective
 
 
 class ConePerceptionNode(Node):
@@ -105,6 +229,19 @@ class ConePerceptionNode(Node):
         self.declare_parameter("y_deadband_m", 0.03)
         self.declare_parameter("track_width_m", 0.6)
 
+        # --- 좌우 소속 이력 기반 완화(ConeSideTracker) ---
+        # match_radius_m 은 직전 프레임의 콘과 이번 프레임 콘을 같은
+        # 물리적 콘으로 볼 최대 거리다. track_width_m/2 보다 충분히 작아야
+        # 반대편 콘을 같은 콘으로 오인하지 않는다. 기본값은 track_width_m
+        # 기본값(0.6)의 1/4.
+        self.declare_parameter("match_radius_m", 0.15)
+        # 반대쪽 판정이 이 시간(초) 동안 연속으로 나와야 실제로 소속을
+        # 바꾼다. 발행 주기가 바뀌어도 유예 시간이 동일하게 유지되도록
+        # 프레임 수가 아니라 시간으로 둔다.
+        self.declare_parameter("override_grace_s", 0.3)
+        # 콘이 이 시간(초) 넘게 매칭되지 않으면 이력을 버린다.
+        self.declare_parameter("missed_timeout_s", 1.0)
+
         # --- 진단 ---
         self.declare_parameter("log_period_s", 1.0)
         self.declare_parameter("calibration_mode", False)
@@ -120,6 +257,12 @@ class ConePerceptionNode(Node):
 
         self.angle_increment = 0.0
         self.last_log_time = 0.0
+
+        self.cone_tracker = ConeSideTracker(
+            match_radius_m=float(self.get_parameter("match_radius_m").value),
+            override_grace_s=float(self.get_parameter("override_grace_s").value),
+            missed_timeout_s=float(self.get_parameter("missed_timeout_s").value),
+        )
 
         self.scan_sub = self.create_subscription(
             LaserScan,
@@ -199,6 +342,31 @@ class ConePerceptionNode(Node):
         )
         self.y_deadband_m = float(self.get_parameter("y_deadband_m").value)
         self.track_width_m = float(self.get_parameter("track_width_m").value)
+
+        self.match_radius_m = float(self.get_parameter("match_radius_m").value)
+        self.override_grace_s = float(
+            self.get_parameter("override_grace_s").value
+        )
+        self.missed_timeout_s = float(
+            self.get_parameter("missed_timeout_s").value
+        )
+
+        # match_radius_m 이 track_width_m/2 이상이면 반대편 콘을 같은
+        # 콘으로 오인할 수 있으므로, 물리적으로 모순된 조합을 clamp한다.
+        max_match_radius = self.track_width_m / 2.0
+        if self.match_radius_m >= max_match_radius:
+            self.get_logger().warn(
+                f"match_radius_m={self.match_radius_m:.3f}m 이 "
+                f"track_width_m/2={max_match_radius:.3f}m 이상이라 좌우 "
+                f"콘을 혼동할 수 있다. {max_match_radius * 0.9:.3f}m 로 "
+                "clamp."
+            )
+            self.match_radius_m = max_match_radius * 0.9
+
+        self.cone_tracker.match_radius_m = self.match_radius_m
+        self.cone_tracker.override_grace_s = self.override_grace_s
+        self.cone_tracker.missed_timeout_s = self.missed_timeout_s
+
         self.log_period_s = float(self.get_parameter("log_period_s").value)
         self.calibration_mode = bool(
             self.get_parameter("calibration_mode").value
@@ -262,11 +430,29 @@ class ConePerceptionNode(Node):
 
         nearest = min(cones, key=lambda c: c["distance"])
 
-        path_msg = self.build_placeholder_path(
-            msg=msg,
-            x=float(nearest["center"][0]),
-            y=float(nearest["center"][1]),
+        timestamp_s = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        left_cones, right_cones = self.split_left_right(
+            cones, timestamp_s=timestamp_s
         )
+
+        # TODO: 임시 디버그 로그 - 확인 끝나면 제거
+        left_xy = [
+            (round(float(c["center"][0]), 3), round(float(c["center"][1]), 3))
+            for c in left_cones
+        ]
+        right_xy = [
+            (round(float(c["center"][0]), 3), round(float(c["center"][1]), 3))
+            for c in right_cones
+        ]
+        self.get_logger().info(
+            f"[debug] split left={len(left_cones)} right={len(right_cones)} "
+            f"left_xy={left_xy} right_xy={right_xy}"
+        )
+
+        path_msg = self.generate_center_path(msg, left_cones, right_cones)
+
+        # TODO: 임시 디버그 로그 - 확인 끝나면 제거
+        self.get_logger().info(f"[debug] center_path poses={len(path_msg.poses)}")
 
         feature_msg = Float32MultiArray()
         feature_msg.data = [
@@ -688,11 +874,13 @@ class ConePerceptionNode(Node):
     def split_left_right(
         self,
         cones: List[Dict],
+        timestamp_s: Optional[float] = None,
     ) -> Tuple[List[Dict], List[Dict]]:
-        """REP 103 기준 y 부호로 좌/우를 나눈다.
+        """REP 103 기준 y 부호로 좌/우를 나누되, 짧은 반대쪽 판정은 유예한다.
 
         y>0 이 왼쪽, y<0 이 오른쪽. |y| < y_deadband_m 인 콘은 정면 근처라
-        노이즈에 취약하므로 어느 쪽에도 넣지 않고 보류한다.
+        노이즈에 취약하므로, 이력이 없는(방금 시야에 들어온) 콘이면 어느
+        쪽에도 넣지 않고 보류한다.
 
         cones 는 detect_cones() 가 이미 거리순으로 정렬해 반환하므로,
         여기서는 부호로만 걸러도 left/right 각각 거리순이 그대로 유지된다.
@@ -716,17 +904,40 @@ class ConePerceptionNode(Node):
         약 1.62m)보다 s_crit 이 작은 반경(대략 R<=3m, 특히 헤어핀)에서는
         한 프레임 안에서 실제로 벌어질 수 있는 문제다. 재현/검증은
         test/test_split_and_path.py 모듈 docstring과 시나리오 참고.
-        """
-        left_cones: List[Dict] = []
-        right_cones: List[Dict] = []
 
+        이력 기반 완화(self.cone_tracker, ConeSideTracker): 위 한계로 한
+        프레임만 반대편 부호가 나온 경우, override_grace_s(초) 동안은
+        직전 소속을 그대로 유지해 순간적인 뒤집힘을 흡수한다. 스윕이
+        override_grace_s 보다 오래 임계각을 넘긴 상태로 유지되면 결국
+        반대편으로 확정된다 — 한계 자체를 없애는 게 아니라 지연시키는
+        것이다. timestamp_s 를 안 주면(과거 호출 방식과 동일) 0.0으로
+        본다. 어차피 매칭할 이력이 없는 최초 호출에서는 결과가 같다.
+        """
+        if timestamp_s is None:
+            timestamp_s = 0.0
+
+        points_xy = np.array(
+            [c["center"] for c in cones], dtype=np.float64
+        ).reshape(-1, 2)
+
+        raw_sides: List[Optional[str]] = []
         for cone in cones:
             y = float(cone["center"][1])
             if abs(y) < self.y_deadband_m:
-                continue
-            if y > 0.0:
-                left_cones.append(cone)
+                raw_sides.append(None)
             else:
+                raw_sides.append("L" if y > 0.0 else "R")
+
+        effective_sides = self.cone_tracker.resolve(
+            points_xy, raw_sides, timestamp_s
+        )
+
+        left_cones: List[Dict] = []
+        right_cones: List[Dict] = []
+        for cone, side in zip(cones, effective_sides):
+            if side == "L":
+                left_cones.append(cone)
+            elif side == "R":
                 right_cones.append(cone)
 
         return left_cones, right_cones

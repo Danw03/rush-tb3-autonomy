@@ -396,3 +396,41 @@ def test_deadband_holds_cone_unassigned(node, scan_msg):
     assert left_out[0]["center"][1] == pytest.approx(0.05)
     assert len(right_out) == 1
     assert right_out[0]["center"][1] == pytest.approx(-0.05)
+
+
+# ----------------------------------------------------------------------
+# 시나리오: 이력 기반 완화 (ConeSideTracker)
+# ----------------------------------------------------------------------
+
+
+def test_gradual_flip_is_held_then_accepted(node):
+    """실제 커브 진입 로그에서 관찰된 패턴 재현: 왼쪽 콘의 y가 서서히
+    줄어 데드밴드에 잠깐 걸리고, 이후 반대쪽(오른쪽) 부호로 넘어간다.
+
+    override_grace_s(기본 0.3s) 동안 반대쪽 판정이 연속으로 나오지
+    않으면 직전 소속(왼쪽)을 유지해야 하고, 그 시간을 다 채우면 그제서야
+    오른쪽으로 확정돼야 한다. x 는 물리적으로 같은 콘임을 나타내기 위해
+    거의 고정해 둔다. 불일치 구간의 dt 는 0.3s 경계에 딱 걸리지 않도록
+    (부동소수점 오차로 인한 flaky 방지) 0.12s 간격으로 잡았다.
+    """
+    x = 1.0
+    frames = [
+        (0.00, 0.050),   # 최초 관측 -> 왼쪽
+        (0.20, 0.048),   # 왼쪽과 일치 -> 왼쪽 유지
+        (0.40, 0.039),   # 왼쪽과 일치 -> 왼쪽 유지
+        (0.60, 0.020),   # |y| < y_deadband_m(0.03) -> 판단 보류, 왼쪽 유지
+        (0.72, -0.032),  # 반대쪽 판정 시작. disagree_s=0.12s < grace
+        (0.84, -0.035),  # disagree_s=0.24s < grace, 아직 왼쪽 유지
+        (0.96, -0.038),  # disagree_s=0.36s >= grace(0.3) -> 오른쪽으로 확정
+        (1.08, -0.040),  # 오른쪽과 일치 -> 오른쪽 유지
+    ]
+    expected_side = ["L", "L", "L", "L", "L", "L", "R", "R"]
+
+    for (t, y), side in zip(frames, expected_side):
+        left_out, right_out = node.split_left_right([_cone(x, y)], timestamp_s=t)
+        if side == "L":
+            assert len(left_out) == 1, f"t={t}: 아직 왼쪽이어야 함"
+            assert len(right_out) == 0, f"t={t}: 오른쪽엔 없어야 함"
+        else:
+            assert len(right_out) == 1, f"t={t}: 오른쪽으로 확정돼야 함"
+            assert len(left_out) == 0, f"t={t}: 왼쪽엔 없어야 함"

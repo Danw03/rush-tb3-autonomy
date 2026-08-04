@@ -455,15 +455,9 @@ class ConePerceptionNode(Node):
         self.get_logger().info(f"[debug] center_path poses={len(path_msg.poses)}")
 
         feature_msg = Float32MultiArray()
-        feature_msg.data = [
-            1.0,
-            float(nearest["distance"]),
-            float(math.atan2(nearest["center"][1], nearest["center"][0])),
-            float(nearest["center"][0]),
-            float(nearest["center"][1]),
-            float(valid_ratio),
-            float(len(ranges)),
-        ]
+        feature_msg.data = self.extract_features(
+            cones, path_msg, valid_ratio, len(ranges)
+        )
 
         self.path_pub.publish(path_msg)
         self.features_pub.publish(feature_msg)
@@ -1094,9 +1088,50 @@ class ConePerceptionNode(Node):
 
         return path_msg
 
-    def extract_features(self, cones, path):
-        """TODO: Return features used by the Reference node classifier."""
-        raise NotImplementedError
+    def extract_features(
+        self,
+        cones: List[Dict],
+        path: Path,
+        valid_ratio: float,
+        point_count: int,
+    ) -> List[float]:
+        """FEATURE_LAYOUT 순서대로 7개 값을 만든다.
+
+        nearest_* 는 split_left_right() 이전의 원시 cones(거리순) 기준이다.
+        split_left_right()/ConeSideTracker 는 정면 근처(데드밴드)에 새로
+        나타난 콘을 좌우 어느 쪽에도 배정하지 않고 버릴 수 있는데
+        (split_left_right 문서의 "알려진 한계" 참고), 그 상태에서 좌우
+        분류 결과로 최근접 거리를 뽑으면 실제로 더 가까운 콘을 놓칠 수
+        있다. minimum_distance_m 은 안전 관련 값이라 그런 누락을 허용하지
+        않는다. 이 메서드는 split_left_right() 를 다시 호출하지 않는다 -
+        ConeSideTracker.resolve() 는 프레임당 정확히 한 번만 불려야
+        이력이 꼬이지 않으며, scan_callback 에서 이미 한 번 호출된다.
+        """
+        if cones:
+            nearest = min(cones, key=lambda c: c["distance"])
+            minimum_distance_m = float(nearest["distance"])
+            nearest_angle_rad = float(
+                math.atan2(nearest["center"][1], nearest["center"][0])
+            )
+            nearest_x_m = float(nearest["center"][0])
+            nearest_y_m = float(nearest["center"][1])
+        else:
+            minimum_distance_m = float("inf")
+            nearest_angle_rad = 0.0
+            nearest_x_m = 0.0
+            nearest_y_m = 0.0
+
+        path_valid = 1.0 if len(path.poses) > 0 else 0.0
+
+        return [
+            path_valid,
+            minimum_distance_m,
+            nearest_angle_rad,
+            nearest_x_m,
+            nearest_y_m,
+            float(valid_ratio),
+            float(point_count),
+        ]
 
 
 def main(args=None) -> None:

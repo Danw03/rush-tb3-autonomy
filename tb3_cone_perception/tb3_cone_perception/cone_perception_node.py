@@ -98,6 +98,13 @@ class ConePerceptionNode(Node):
         self.declare_parameter("cluster_gap_span_factor", 2.0)
         self.declare_parameter("cluster_min_points", 3) # 원을 그리려면 최소 3개의 점이 필요함
 
+        # --- 좌우 분류 / 중심 경로 ---
+        # y_deadband_m 안쪽(|y| < 값)인 콘은 좌우 어느 쪽도 아니라고 보고 보류한다.
+        # track_width_m 은 편측만 보일 때 반대편 가상 콘을 만드는 데 쓰는
+        # 트랙 폭(콘-콘 간 거리)이다. 실측 코스 폭에 맞게 다시 재야 한다.
+        self.declare_parameter("y_deadband_m", 0.03)
+        self.declare_parameter("track_width_m", 0.6)
+
         # --- 진단 ---
         self.declare_parameter("log_period_s", 1.0)
         self.declare_parameter("calibration_mode", False)
@@ -190,6 +197,8 @@ class ConePerceptionNode(Node):
         self.cluster_min_points = max(
             3, int(self.get_parameter("cluster_min_points").value)
         )
+        self.y_deadband_m = float(self.get_parameter("y_deadband_m").value)
+        self.track_width_m = float(self.get_parameter("track_width_m").value)
         self.log_period_s = float(self.get_parameter("log_period_s").value)
         self.calibration_mode = bool(
             self.get_parameter("calibration_mode").value
@@ -676,13 +685,203 @@ class ConePerceptionNode(Node):
     # 남은 TODO
     # ------------------------------------------------------------------
 
-    def split_left_right(self, cones):
-        """TODO: Classify or connect left/right cone boundaries."""
-        raise NotImplementedError
+    def split_left_right(
+        self,
+        cones: List[Dict],
+    ) -> Tuple[List[Dict], List[Dict]]:
+        """REP 103 기준 y 부호로 좌/우를 나눈다.
 
-    def generate_center_path(self, msg: LaserScan, left_cones, right_cones):
-        """TODO: Generate and smooth the center path."""
-        raise NotImplementedError
+        y>0 이 왼쪽, y<0 이 오른쪽. |y| < y_deadband_m 인 콘은 정면 근처라
+        노이즈에 취약하므로 어느 쪽에도 넣지 않고 보류한다.
+
+        cones 는 detect_cones() 가 이미 거리순으로 정렬해 반환하므로,
+        여기서는 부호로만 걸러도 left/right 각각 거리순이 그대로 유지된다.
+        (안정 필터링이므로 상대 순서가 보존된다.)
+
+        범위/각도 게이트는 detect_cones() 이전 단계(cluster_lidar_points)의
+        range_gate_max_m 이 이미 처리했으므로 여기서 다시 걸지 않는다.
+
+        알려진 한계 (반평면 분할을 쓰는 대가로 받아들인 것, 버그 아님):
+        커브의 "바깥쪽" 콘은 로봇 헤딩 기준 스윕각이 임계각을 넘으면 y
+        부호가 뒤집혀 반대편으로 오분류된다. 안쪽 콘은 이 범위에서 뒤집히지
+        않는다 — 위험한 건 항상 바깥쪽 콘뿐이다.
+
+            theta_crit = arccos(R / (R + track_width_m / 2))
+            s_crit = R * theta_crit   (로봇에서 그 지점까지 호 길이)
+
+        track_width_m=0.6 기준: R=3.0m -> 24.6도/1.29m, R=1.3m ->
+        35.7도/0.81m, R=1.0m -> 39.7도/0.69m, R=0.5m -> 51.3도/0.45m.
+        반경이 작을수록(급커브·헤어핀일수록) s_crit 이 짧아져 더 쉽게
+        걸린다. 기본 파라미터의 effective_range_max()(콘 검출 유효거리,
+        약 1.62m)보다 s_crit 이 작은 반경(대략 R<=3m, 특히 헤어핀)에서는
+        한 프레임 안에서 실제로 벌어질 수 있는 문제다. 재현/검증은
+        test/test_split_and_path.py 모듈 docstring과 시나리오 참고.
+        """
+        left_cones: List[Dict] = []
+        right_cones: List[Dict] = []
+
+        for cone in cones:
+            y = float(cone["center"][1])
+            if abs(y) < self.y_deadband_m:
+                continue
+            if y > 0.0:
+                left_cones.append(cone)
+            else:
+                right_cones.append(cone)
+
+        return left_cones, right_cones
+
+    @staticmethod
+    def _greedy_chain_from_origin(points_xy: np.ndarray) -> np.ndarray:
+        """최근접 이웃 그리디 체이닝.
+
+        로봇 원점 (0,0) 에서 가장 가까운 점부터 시작해, 남은 점 중 현재
+        점에서 가장 가까운 것을 계속 골라 이어 붙인다. 거리순 정렬을 그대로
+        쓰지 않는 이유는 헤어핀처럼 원점 기준 거리와 실제 진행 순서가
+        어긋날 수 있는 배치에서도 물리적으로 인접한 콘끼리 이어지도록
+        하기 위함이다.
+        """
+        remaining = list(range(points_xy.shape[0]))
+        ordered: List[int] = []
+        current = np.zeros(2, dtype=np.float64)
+
+        while remaining:
+            deltas = points_xy[remaining] - current
+            dists = np.hypot(deltas[:, 0], deltas[:, 1])
+            pick = int(np.argmin(dists))
+            chosen = remaining.pop(pick)
+            ordered.append(chosen)
+            current = points_xy[chosen]
+
+        return points_xy[ordered]
+
+    @staticmethod
+    def _path_tangents(chain: np.ndarray) -> np.ndarray:
+        """체인의 각 점에서 진행방향 단위벡터를 구한다.
+
+        중간 점은 앞뒤 이웃의 중앙차분, 양 끝점은 편차분을 쓴다.
+        점이 하나뿐이면 원점에서 그 점을 향하는 방향을 진행방향으로 본다.
+        """
+        n = chain.shape[0]
+        tangents = np.zeros_like(chain)
+        fallback = np.array([1.0, 0.0])
+
+        if n == 1:
+            norm = float(np.linalg.norm(chain[0]))
+            tangents[0] = chain[0] / norm if norm > 1e-6 else fallback
+            return tangents
+
+        for i in range(n):
+            if i == 0:
+                delta = chain[1] - chain[0]
+            elif i == n - 1:
+                delta = chain[-1] - chain[-2]
+            else:
+                delta = chain[i + 1] - chain[i - 1]
+            norm = float(np.linalg.norm(delta))
+            tangents[i] = delta / norm if norm > 1e-6 else fallback
+
+        return tangents
+
+    def _mirror_centers(
+        self,
+        chain: np.ndarray,
+        tangents: np.ndarray,
+        side: str,
+    ) -> np.ndarray:
+        """보이는 한쪽 콘에서 진행방향 수직으로 track_width_m 만큼 평행이동해
+        반대편 가상 콘을 만들고, 그 중점을 반환한다.
+
+        side='left'  : chain 이 왼쪽(y>0) 콘 -> 오른쪽으로 offset
+        side='right' : chain 이 오른쪽(y<0) 콘 -> 왼쪽으로 offset
+
+        진행방향 (dx,dy) 를 -90도 회전하면 (dy,-dx) 로 오른쪽 수직,
+        +90도 회전하면 (-dy,dx) 로 왼쪽 수직이 된다.
+        """
+        if side == "left":
+            perp = np.column_stack((tangents[:, 1], -tangents[:, 0]))
+        else:
+            perp = np.column_stack((-tangents[:, 1], tangents[:, 0]))
+
+        virtual = chain + self.track_width_m * perp
+        return (chain + virtual) / 2.0
+
+    def _center_from_both_sides(
+        self,
+        left_xy: np.ndarray,
+        right_xy: np.ndarray,
+    ) -> np.ndarray:
+        """양쪽 다 보일 때: 각 쪽을 그리디 체이닝한 뒤 인덱스로 페어링해
+        중점을 잇는다.
+
+        좌우 콘 개수가 다르면(경계혼합) 짧은 쪽 길이만큼만 정상 페어링하고,
+        긴 쪽의 나머지는 편측 전용 로직(가상 콘 미러링)으로 이어 붙여
+        경로가 도중에 끊기거나 뒤로 점프하지 않도록 한다.
+        """
+        chain_l = self._greedy_chain_from_origin(left_xy)
+        chain_r = self._greedy_chain_from_origin(right_xy)
+
+        n = min(chain_l.shape[0], chain_r.shape[0])
+        centers = (chain_l[:n] + chain_r[:n]) / 2.0
+
+        if chain_l.shape[0] > n:
+            tangents = self._path_tangents(chain_l)[n:]
+            tail = self._mirror_centers(chain_l[n:], tangents, side="left")
+            centers = np.vstack([centers, tail])
+        elif chain_r.shape[0] > n:
+            tangents = self._path_tangents(chain_r)[n:]
+            tail = self._mirror_centers(chain_r[n:], tangents, side="right")
+            centers = np.vstack([centers, tail])
+
+        return centers
+
+    def generate_center_path(
+        self,
+        msg: LaserScan,
+        left_cones: List[Dict],
+        right_cones: List[Dict],
+    ) -> Path:
+        """좌/우 콘 목록으로 중심 경로(Path)를 만든다.
+
+          * 양쪽 다 있으면 -> _center_from_both_sides (그리디 체이닝 + 페어링)
+          * 한쪽만 있으면 -> 진행방향 수직 offset 으로 가상 콘을 만들어 중점 계산
+          * 둘 다 없으면 -> 빈 Path (path_valid=0, distance=inf 는 기존 로직 유지)
+        """
+        path_msg = Path()
+        path_msg.header.stamp = msg.header.stamp
+        path_msg.header.frame_id = msg.header.frame_id
+
+        left_xy = np.array(
+            [c["center"] for c in left_cones], dtype=np.float64
+        ).reshape(-1, 2)
+        right_xy = np.array(
+            [c["center"] for c in right_cones], dtype=np.float64
+        ).reshape(-1, 2)
+
+        if left_xy.shape[0] == 0 and right_xy.shape[0] == 0:
+            return path_msg
+
+        if left_xy.shape[0] > 0 and right_xy.shape[0] > 0:
+            centers = self._center_from_both_sides(left_xy, right_xy)
+        elif left_xy.shape[0] > 0:
+            chain = self._greedy_chain_from_origin(left_xy)
+            tangents = self._path_tangents(chain)
+            centers = self._mirror_centers(chain, tangents, side="left")
+        else:
+            chain = self._greedy_chain_from_origin(right_xy)
+            tangents = self._path_tangents(chain)
+            centers = self._mirror_centers(chain, tangents, side="right")
+
+        for cx, cy in centers:
+            pose = PoseStamped()
+            pose.header = path_msg.header
+            pose.pose.position.x = float(cx)
+            pose.pose.position.y = float(cy)
+            pose.pose.position.z = 0.0
+            pose.pose.orientation.w = 1.0
+            path_msg.poses.append(pose)
+
+        return path_msg
 
     def extract_features(self, cones, path):
         """TODO: Return features used by the Reference node classifier."""

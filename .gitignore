@@ -7,3 +7,7 @@ __pycache__/
 .vscode/
 .idea/
 .DS_Store
+.claude/
+CLAUDE.md
+_reference/
+_bags/

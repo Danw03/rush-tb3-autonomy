@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 
 import math
-from typing import Dict, List, Optional, Tuple
+from collections import deque
+from typing import Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 import rclpy
@@ -138,6 +139,30 @@ class ConeSideTracker:
         return effective
 
 
+class ConeCountStabilityTracker:
+    """최근 window 프레임 중 "콘 개수>=2" 였던 프레임 수를 센다.
+
+    ConeSideTracker(좌우 소속 이력)와는 완전히 무관한 별도 상태다. 슬롯
+    매칭 같은 물리적 대응 관계가 필요 없는 단순 카운터라 deque(maxlen=
+    window) 하나로 충분하다 - ConeSideTracker 수준의 로직이 필요 없다.
+
+    ROS 의존이 없는 순수 python 이라 노드 없이 단위 테스트할 수 있다.
+    """
+
+    def __init__(self, window: int = 10) -> None:
+        self._history: Deque[bool] = deque(maxlen=window)
+
+    def update(self, cone_count: int) -> int:
+        """이번 프레임의 콘 개수를 기록하고 누적 stable 프레임 수를 반환한다.
+
+        노드 시작 직후 window 프레임이 채 쌓이기 전에는 그때까지 쌓인
+        프레임만으로 계산한다(부분 윈도우) - deque(maxlen=...)가 오래된
+        프레임을 자동으로 밀어내므로 별도 처리가 필요 없다.
+        """
+        self._history.append(cone_count >= 2)
+        return sum(self._history)
+
+
 class ConePerceptionNode(Node):
     """
     Cone-perception pipeline (LiDAR team).
@@ -164,25 +189,39 @@ class ConePerceptionNode(Node):
       4. generate_center_path - 중심 경로 생성
       5. extract_features     - 최종 feature 벡터
 
-      /cone_features 로 내보내는 숫자 7개 순서 약속
+      /cone_features 로 내보내는 숫자 7개 순서 약속 (MPC 팀 요구사항 반영,
+      2026-08-06 전면 교체 - 기존 7개와 호환되지 않는 breaking change)
 
-      0 path_valid 결과가 쓸만한가(double)
-      1 minimum_distance_m 가장 가까운 콘까지의 거리
-      2 nearest_angle_rad 그 콘의 방향
-      3 nearest_x_m
-      4 nearest_y_m
-      5 valid_scan_ratio 쓸 만한 측정값 비율
-      6 valid_point_count 쓸 만한 측정값 개수
+      0 cone_count 현재 인식된 콘 개수
+      1 nearest_distance_m 가장 가까운 콘까지의 거리
+      2 mean_x_m 인식된 콘들의 x좌표 평균
+      3 mean_y_m 인식된 콘들의 y좌표 평균
+      4 std_x_m 인식된 콘들의 x좌표 표준편차 (모표준편차, ddof=0)
+      5 std_y_m 인식된 콘들의 y좌표 표준편차 (모표준편차, ddof=0)
+      6 stable_frame_count 최근 10프레임 중 콘 개수>=2였던 프레임 수
+
+      기준 리스트는 split_left_right() 이전의 원시 cones(거리순)다 -
+      좌우분류로 유실될 수 있는 정면 근처 콘도 반영돼야 하므로.
+
+      콘 0개일 때: cone_count=0, nearest_distance_m=inf, mean/std=0.0
+      (mean/std는 별도 sentinel이 아니라 빈 집합에 대한 자연스러운 값).
+      stable_frame_count는 콘 0개 프레임에서도 sentinel로 0 처리하지
+      않고 ConeCountStabilityTracker의 실제 누적값을 그대로 낸다 -
+      이번 프레임이 불안정(콘<2)했다는 사실 자체가 그 트래커의 정상
+      입력이기 때문이다.
+
+      path_valid는 더 이상 없다. /cone_path 가 비어있으면(poses=0) 그
+      자체로 경로 무효를 나타내므로 features 에서 중복 제공하지 않는다.
     """
 
     FEATURE_LAYOUT = [
-        "path_valid",
-        "minimum_distance_m",
-        "nearest_angle_rad",
-        "nearest_x_m",
-        "nearest_y_m",
-        "valid_scan_ratio",
-        "valid_point_count",
+        "cone_count",
+        "nearest_distance_m",
+        "mean_x_m",
+        "mean_y_m",
+        "std_x_m",
+        "std_y_m",
+        "stable_frame_count",
     ]
 
     DETECTION_LAYOUT = ["x_m", "y_m", "radius_m", "point_count"]
@@ -263,6 +302,7 @@ class ConePerceptionNode(Node):
             override_grace_s=float(self.get_parameter("override_grace_s").value),
             missed_timeout_s=float(self.get_parameter("missed_timeout_s").value),
         )
+        self.stability_tracker = ConeCountStabilityTracker(window=10)
 
         self.scan_sub = self.create_subscription(
             LaserScan,
@@ -409,7 +449,8 @@ class ConePerceptionNode(Node):
         points, ranges, angles, valid_ratio = self.preprocess_scan(msg)
 
         if len(ranges) == 0:
-            self.publish_empty_result(msg, valid_ratio)
+            stable_frame_count = self.stability_tracker.update(0)
+            self.publish_empty_result(msg, stable_frame_count)
             self.publish_detections(msg, [])
             if self.publish_markers:
                 self.publish_cone_markers(msg, [])
@@ -423,8 +464,13 @@ class ConePerceptionNode(Node):
         if self.publish_markers:
             self.publish_cone_markers(msg, cones)
 
+        # stability_tracker.update() 는 프레임당 정확히 한 번만 불려야
+        # 한다(ConeSideTracker.resolve() 와 동일한 이유) - 이 지점에서
+        # 한 번만 호출하고 아래 두 분기(빈 결과/정상 결과)가 공유한다.
+        stable_frame_count = self.stability_tracker.update(len(cones))
+
         if not cones:
-            self.publish_empty_result(msg, valid_ratio)
+            self.publish_empty_result(msg, stable_frame_count)
             self.log_summary(len(clusters), 0, None, valid_ratio, len(ranges))
             return
 
@@ -455,9 +501,7 @@ class ConePerceptionNode(Node):
         self.get_logger().info(f"[debug] center_path poses={len(path_msg.poses)}")
 
         feature_msg = Float32MultiArray()
-        feature_msg.data = self.extract_features(
-            cones, path_msg, valid_ratio, len(ranges)
-        )
+        feature_msg.data = self.extract_features(cones, stable_frame_count)
 
         self.path_pub.publish(path_msg)
         self.features_pub.publish(feature_msg)
@@ -645,14 +689,83 @@ class ConePerceptionNode(Node):
 
         return cx, cy, radius, rms
 
+    @staticmethod
+    def fit_fixed_radius(
+        cluster: np.ndarray,
+        radius: float,
+        iterations: int = 12,
+    ) -> Tuple[float, float, float]:
+        """반지름을 콘의 물리 상수로 고정한 원 피팅. (cx, cy, rms) 반환.
+
+        fit_circle() 은 중심과 반지름을 동시에 푸는데, 점이 몇 개 안 되는
+        짧은 호에서는 두 미지수가 서로 상쇄돼 반지름이 잘못 나와도 잔차가
+        낮게 나올 수 있다는 가설이 있었다. calibration_mode 로그(트랙 bag
+        lidar_drive_01/02 실측)로 확인한 결과: n=3은 세 점이 원을 유일하게
+        결정해 fit_circle() 잔차가 항상 0이라 반지름 오류를 전혀 걸러내지
+        못했고, n=4도 반지름이 범위를 벗어난 후보 중 47.9%가 fit_circle()
+        잔차만으로는 낮게 나와 걸러지지 않았다. 이 함수는 반지름을 콘의
+        물리 상수(radius)로 고정하고 중심 2개만 가우스-뉴턴으로 풀어 그
+        함정을 피한다.
+
+        detect_cones() 는 점 개수 4개 이하인 클러스터의 최종 판정(원 모양
+        검사)에 이 함수의 rms 를 쓴다. 점 5개 이상은 여전히 fit_circle()
+        의 자유 반지름 잔차로 판정한다 - 그 구간의 신뢰도는 별도로 실측
+        검증되지 않았으므로 바꾸지 않는다.
+
+        초기값은 무게중심을 센서 반대방향으로 radius 만큼 민 점이며, 부분
+        호에서도 참값에 가깝다.
+        """
+        centroid = cluster.mean(axis=0)
+        norm = float(np.linalg.norm(centroid))
+        direction = (
+            centroid / norm if norm > 1e-9 else np.array([1.0, 0.0])
+        )
+        centre = centroid + radius * direction
+
+        for _ in range(iterations):
+            delta = cluster - centre
+            distance = np.maximum(np.linalg.norm(delta, axis=1), 1e-9)
+            jacobian = -delta / distance[:, None]
+            gradient = jacobian.T @ (distance - radius)
+            hessian = jacobian.T @ jacobian
+            try:
+                step = -np.linalg.solve(hessian, gradient)
+            except np.linalg.LinAlgError:
+                break
+            centre = centre + step
+            if float(np.linalg.norm(step)) < 1e-10:
+                break
+
+        distance = np.linalg.norm(cluster - centre, axis=1)
+        rms = float(np.sqrt(np.mean((distance - radius) ** 2)))
+        return float(centre[0]), float(centre[1]), rms
+
     def detect_cones(self, clusters: List[np.ndarray]) -> List[Dict]:
         """콘의 실제 기하와 일치하는 클러스터만 남긴다.
 
         네 단계 검사:
           1. 폭     - 콘 지름보다 크게 벗어나면 벽
           2. 점 개수 - 이 거리에서 콘이라면 찍혀야 할 개수와 비교
-          3. 반지름  - 원을 피팅해 콘 반지름과 일치하는지
-          4. 잔차   - 실제로 원 모양인지 (점 4개 이상일 때만 유효)
+          3. 반지름  - fit_circle()(자유 반지름) 결과가 콘 반지름과
+                       일치하는지. 이 게이트는 점 개수와 무관하게 항상
+                       자유 반지름 피팅 기준이다.
+          4. 잔차   - 실제로 원 모양인지. 점 개수에 따라 판정 방식이
+                       다르다(calibration_mode 로그, 트랙 bag
+                       lidar_drive_01/02 실측 근거):
+                         n<=4 : fit_fixed_radius()(반지름을 콘의 물리
+                                상수로 고정) 잔차로 판정한다. 자유
+                                반지름 피팅은 n=3이면 중심 2개와 반지름이
+                                함께 풀리며 원이 항상 유일하게 결정돼
+                                잔차가 무조건 0이고, n=4도 실측상 반지름이
+                                범위를 벗어난 후보의 47.9%가 자유 반지름
+                                잔차만으로는 걸러지지 않았다.
+                         n>=5 : 기존 fit_circle() 자유 반지름 잔차로
+                                판정한다. 이 구간의 신뢰도는 아직 별도
+                                실측 검증이 없으므로 바꾸지 않는다.
+
+        calibration_mode 에서는 점 개수와 무관하게 fit_fixed_radius()
+        결과도 항상 로그로 찍어 fit_circle() 과 나란히 비교할 수 있게
+        한다.
         """
         cones: List[Dict] = []
         radius_expected = self.cone_diameter_m / 2.0
@@ -668,11 +781,22 @@ class ConePerceptionNode(Node):
 
             cx, cy, radius, rms = self.fit_circle(cluster)
 
+            # n<=4 는 최종 판정에도 fixed_rms 가 필요하므로 calibration_mode
+            # 와 무관하게 미리 구해 둔다. n>=5 는 판정에 쓰지 않으니
+            # calibration_mode 로깅용일 때만 계산한다.
+            fixed_rms = None
+            if count <= 4 or self.calibration_mode:
+                _, _, fixed_rms = self.fit_fixed_radius(
+                    cluster, radius_expected
+                )
+
             if self.calibration_mode:
                 self.get_logger().info(
                     f"  [cal] n={count:3d} d={distance:5.2f}m "
-                    f"width={width:.3f}m fit_diameter={2.0 * radius:.3f}m "
-                    f"rms={rms:.4f}m"
+                    f"width={width:.3f}m | "
+                    f"free: diameter={2.0 * radius:.3f}m rms={rms:.4f}m | "
+                    f"fixed(r={2.0 * radius_expected:.3f}m): "
+                    f"rms={fixed_rms:.4f}m"
                 )
 
             if distance <= 1e-6 or width > width_max:
@@ -690,9 +814,13 @@ class ConePerceptionNode(Node):
             if not (radius_low <= radius <= radius_high):
                 continue
 
-            # 점이 3개면 원이 정확히 하나로 결정되어 잔차가 항상 0이 된다.
-            # 이 경우 잔차 검사는 정보가 없으므로 건너뛴다.
-            if count >= 4 and rms > self.cone_fit_rms_max_m:
+            # n<=4: 자유 반지름 잔차는 신뢰할 수 없다(위 docstring 참고).
+            # 반지름을 콘의 물리 상수로 고정한 fixed_rms 로 대신 판정한다.
+            # n>=5: 기존 자유 반지름 잔차 판정을 그대로 쓴다.
+            if count <= 4:
+                if fixed_rms > self.cone_fit_rms_max_m:
+                    continue
+            elif rms > self.cone_fit_rms_max_m:
                 continue
 
             cones.append(
@@ -741,22 +869,19 @@ class ConePerceptionNode(Node):
     def publish_empty_result(
         self,
         msg: LaserScan,
-        valid_ratio: float,
+        stable_frame_count: int,
     ) -> None:
+        """콘이 하나도 없을 때(빈 스캔 또는 cones=[])의 결과.
+
+        sentinel 값은 extract_features([], ...) 가 이미 정의하고 있으므로
+        여기서 다시 나열하지 않는다 - 값이 어긋날 여지를 없앤다.
+        """
         path_msg = Path()
         path_msg.header.stamp = msg.header.stamp
         path_msg.header.frame_id = msg.header.frame_id
 
         feature_msg = Float32MultiArray()
-        feature_msg.data = [
-            0.0,
-            float("inf"),
-            0.0,
-            0.0,
-            0.0,
-            float(valid_ratio),
-            0.0,
-        ]
+        feature_msg.data = self.extract_features([], stable_frame_count)
 
         self.path_pub.publish(path_msg)
         self.features_pub.publish(feature_msg)
@@ -1091,46 +1216,55 @@ class ConePerceptionNode(Node):
     def extract_features(
         self,
         cones: List[Dict],
-        path: Path,
-        valid_ratio: float,
-        point_count: int,
+        stable_frame_count: int,
     ) -> List[float]:
-        """FEATURE_LAYOUT 순서대로 7개 값을 만든다.
+        """FEATURE_LAYOUT 순서대로 7개 값을 만든다 (MPC 팀 요구사항).
 
-        nearest_* 는 split_left_right() 이전의 원시 cones(거리순) 기준이다.
+        기준 리스트는 split_left_right() 이전의 원시 cones(거리순)다.
         split_left_right()/ConeSideTracker 는 정면 근처(데드밴드)에 새로
         나타난 콘을 좌우 어느 쪽에도 배정하지 않고 버릴 수 있는데
         (split_left_right 문서의 "알려진 한계" 참고), 그 상태에서 좌우
-        분류 결과로 최근접 거리를 뽑으면 실제로 더 가까운 콘을 놓칠 수
-        있다. minimum_distance_m 은 안전 관련 값이라 그런 누락을 허용하지
-        않는다. 이 메서드는 split_left_right() 를 다시 호출하지 않는다 -
-        ConeSideTracker.resolve() 는 프레임당 정확히 한 번만 불려야
-        이력이 꼬이지 않으며, scan_callback 에서 이미 한 번 호출된다.
+        분류 결과로 통계를 뽑으면 실제 콘 하나를 통째로 누락하게 된다.
+        cone_count/nearest_distance_m 은 안전 관련 값이라 그런 누락을
+        허용하지 않으며, mean/std 도 동일한 원칙을 그대로 따른다.
+
+        stable_frame_count 는 scan_callback 에서 이미 갱신된
+        ConeCountStabilityTracker.update() 결과를 그대로 받는다 - 이
+        메서드 안에서 다시 갱신하면 프레임당 두 번 카운트된다
+        (ConeSideTracker.resolve() 와 동일한 이유로 호출 지점을 하나로
+        고정한다).
+
+        콘이 하나도 없으면(cones=[]) cone_count=0, nearest_distance_m=inf,
+        mean/std=0.0 을 낸다 - mean/std 는 별도 sentinel이 아니라 빈
+        집합에 대한 자연스러운 값이다. stable_frame_count 는 이 경우에도
+        sentinel로 강제되지 않고 트래커의 실제 누적값을 그대로 낸다.
         """
+        cone_count = len(cones)
+
         if cones:
             nearest = min(cones, key=lambda c: c["distance"])
-            minimum_distance_m = float(nearest["distance"])
-            nearest_angle_rad = float(
-                math.atan2(nearest["center"][1], nearest["center"][0])
-            )
-            nearest_x_m = float(nearest["center"][0])
-            nearest_y_m = float(nearest["center"][1])
+            nearest_distance_m = float(nearest["distance"])
+            xs = np.array([c["center"][0] for c in cones], dtype=np.float64)
+            ys = np.array([c["center"][1] for c in cones], dtype=np.float64)
+            mean_x_m = float(np.mean(xs))
+            mean_y_m = float(np.mean(ys))
+            std_x_m = float(np.std(xs))  # ddof=0 (모표준편차) 기본값
+            std_y_m = float(np.std(ys))
         else:
-            minimum_distance_m = float("inf")
-            nearest_angle_rad = 0.0
-            nearest_x_m = 0.0
-            nearest_y_m = 0.0
-
-        path_valid = 1.0 if len(path.poses) > 0 else 0.0
+            nearest_distance_m = float("inf")
+            mean_x_m = 0.0
+            mean_y_m = 0.0
+            std_x_m = 0.0
+            std_y_m = 0.0
 
         return [
-            path_valid,
-            minimum_distance_m,
-            nearest_angle_rad,
-            nearest_x_m,
-            nearest_y_m,
-            float(valid_ratio),
-            float(point_count),
+            float(cone_count),
+            nearest_distance_m,
+            mean_x_m,
+            mean_y_m,
+            std_x_m,
+            std_y_m,
+            float(stable_frame_count),
         ]
 
 

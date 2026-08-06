@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import math
+import collections
+from collections import deque
 
 import cv2
 import rclpy

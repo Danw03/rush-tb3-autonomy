@@ -29,13 +29,13 @@ class LanePerceptionNode(Node):
         self.declare_parameter('features_topic', '/lane_features')
 
         # Tuning parameters
-        self.declare_parameter('intersection_threshold', 20000)
+        self.declare_parameter('intersection_threshold', 30000)
         self.declare_parameter('ema_alpha', 0.7)
         self.declare_parameter('lane_width_offset', 250)
         self.declare_parameter('turn_end_margin', 40)
         self.declare_parameter('min_hist_thresh', 20)
         self.declare_parameter('expected_lane_width', 500)
-        self.declare_parameter('dynamic_margin', 200)
+        self.declare_parameter('dynamic_margin', 150)
 
         # 픽셀을 미터로 변환하기 위한 스케일 파라미터 (캘리브레이션 필요)
         # 0.001은 1픽셀 당 1mm(0.001m)를 의미
@@ -93,8 +93,8 @@ class LanePerceptionNode(Node):
     def warp_birdseye(self, img):
         h, w = img.shape[:2]
         pts_src = np.float32([
-            [w * 0.0, h * 0.80],
-            [w * 1.0, h * 0.80],
+            [w * 0.0, h * 0.70],
+            [w * 1.0, h * 0.70],
             [-w * 0.2, h * 1.0],
             [w * 1.2, h * 1.0]
         ])
@@ -303,7 +303,7 @@ class LanePerceptionNode(Node):
             if is_lane_recovered and not is_crossroad_detected:
                 self.in_intersection_mode = False
                 self.turn_direction = "STRAIGHT"
-                self.get_logger().info("✅ [차선 복귀]")
+                self.get_logger().info("[차선 복귀]")
             else:
                 intersection_flag_value = 1.0
 

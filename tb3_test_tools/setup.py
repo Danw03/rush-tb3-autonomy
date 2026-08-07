@@ -64,6 +64,10 @@ setup(
                 'tb3_test_tools.image_sample_publisher:main'
             ),
             (
+                'video_sample_publisher = '
+                'tb3_test_tools.video_sample_publisher:main'
+            ),
+            (
                 'scan_sample_publisher = '
                 'tb3_test_tools.scan_sample_publisher:main'
             ),

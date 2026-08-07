@@ -1,7 +1,6 @@
-reference_node:
+camera_reference_node:
   ros__parameters:
-    cone_path_topic: /cone_path
-    cone_features_topic: /cone_features
+    lane_path_topic: /lane_path
     reference_path_topic: /reference_path
     reference_speed_topic: /reference_speed
     driving_mode_topic: /driving_mode
@@ -12,11 +11,12 @@ reference_node:
     allow_latest_transform_fallback: true
     publish_rate_hz: 10.0
 
-    minimum_cone_count: 1
-    prepend_robot_origin: true
+    # The calibrated lane path already starts in front of the robot. Adding
+    # (0, 0) can create a sideways first segment and command a large yaw.
+    prepend_robot_origin: false
     minimum_point_separation_m: 0.01
     minimum_path_length_m: 0.05
-    maximum_path_length_m: 2.0
+    maximum_path_length_m: 1.0
     resample_spacing_m: 0.03
     smoothing_window: 3
-    reference_speed_mps: 0.05
+    reference_speed_mps: 0.03

@@ -22,10 +22,10 @@ mpc_controller:
     qp_eps_abs: 1.0e-4
     qp_eps_rel: 1.0e-4
 
-    reference_speed_default: 0.03
+    reference_speed_default: 0.05
     input_timeout: 0.5
 
     odom_topic: /odom
     reference_path_topic: /reference_path
     reference_speed_topic: /reference_speed
-    cmd_topic: /cmd_vel_raw
+    cmd_topic: /cmd_vel

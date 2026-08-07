@@ -41,6 +41,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'camera_reference_node = '
+            'tb3_reference.camera_reference_node:main',
             'reference_generator_node = '
             'tb3_reference.reference_generator_node:main',
         ],

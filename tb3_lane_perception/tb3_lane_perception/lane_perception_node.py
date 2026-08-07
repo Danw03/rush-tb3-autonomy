@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 
-#!/usr/bin/env python3
-
 import collections
 import math
 from collections import deque
@@ -19,15 +17,7 @@ from std_msgs.msg import Float32MultiArray
 class LanePerceptionNode(Node):
     """
     Camera-based lane perception node using 2nd-order curve fitting and state machine.
-
-    Input
-    -----
-    /camera/image_raw : sensor_msgs/msg/Image
-
-    Output
-    ------
-    /lane_features : std_msgs/msg/Float32MultiArray
-        - data[0:20] : 10 waypoints (x1, y1, x2, y2, ... x10, y10) of MPC path
+    * Includes Canny edge detection, smart start points, and dynamic margin search.
     """
 
     def __init__(self) -> None:
@@ -38,11 +28,15 @@ class LanePerceptionNode(Node):
         self.declare_parameter('features_topic', '/lane_features')
 
         # Tuning parameters (알고리즘 튜닝용)
-        self.declare_parameter('intersection_threshold', 20000)
+        self.declare_parameter('intersection_threshold', 30000)
         self.declare_parameter('ema_alpha', 0.7)
         self.declare_parameter('lane_width_offset', 250)
         self.declare_parameter('turn_end_margin', 40)
         self.declare_parameter('min_hist_thresh', 20)
+        
+        # New Tuning parameters for Robust Tracking
+        self.declare_parameter('expected_lane_width', 500)
+        self.declare_parameter('dynamic_margin', 150)
 
         image_topic = str(self.get_parameter('image_topic').value)
         features_topic = str(self.get_parameter('features_topic').value)
@@ -54,6 +48,10 @@ class LanePerceptionNode(Node):
         self.intersection_y = 0
         self.turn_history = deque(maxlen=5)
         self.prev_fit = None
+        
+        # Smart tracking memory variables
+        self.prev_leftx_base = None
+        self.prev_rightx_base = None
 
         self.bridge = CvBridge()
 
@@ -78,14 +76,23 @@ class LanePerceptionNode(Node):
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         lower_white = np.array([0, 0, 180])
         upper_white = np.array([180, 100, 255])
-        mask = cv2.inRange(hsv, lower_white, upper_white)
-        return mask
+        color_mask = cv2.inRange(hsv, lower_white, upper_white)
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        edge_mask = cv2.Canny(blur, 50, 150)
+
+        combined_mask = cv2.bitwise_or(color_mask, edge_mask)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel)
+        
+        return combined_mask
 
     def warp_birdseye(self, img):
         h, w = img.shape[:2]
         pts_src = np.float32([
-            [w * 0.0, h * 0.80],
-            [w * 1.0, h * 0.80],
+            [w * 0.0, h * 0.70],
+            [w * 1.0, h * 0.70],
             [-w * 0.2, h * 1.0],
             [w * 1.2, h * 1.0]
         ])
@@ -118,10 +125,8 @@ class LanePerceptionNode(Node):
                 if fit_center is not None:
                     y_bottom = h
                     x_bottom = fit_center[0] * (y_bottom**2) + fit_center[1] * y_bottom + fit_center[2]
-                    
                     y_target = win_y_low
                     x_target = fit_center[0] * (y_target**2) + fit_center[1] * y_target + fit_center[2]
-                    
                     turn_direction = "LEFT" if x_target < x_bottom else "RIGHT"
                 else:
                     left_density = np.count_nonzero(window_slice[:, :midpoint])
@@ -134,6 +139,9 @@ class LanePerceptionNode(Node):
 
     def find_lane_points(self, binary_warped):
         min_hist_thresh = self.get_parameter('min_hist_thresh').value
+        expected_lane_width = self.get_parameter('expected_lane_width').value
+        dynamic_margin = self.get_parameter('dynamic_margin').value
+        
         h, w = binary_warped.shape
         midpoint = w // 2
         
@@ -143,15 +151,31 @@ class LanePerceptionNode(Node):
         left_hist = histogram[:midpoint]
         right_hist = histogram[midpoint:]
         
-        if np.max(left_hist) > min_hist_thresh:
+        left_found = np.max(left_hist) > min_hist_thresh
+        right_found = np.max(right_hist) > min_hist_thresh
+
+        # --- [1. 스마트 시작점 추정] ---
+        if left_found:
             leftx_base = np.argmax(left_hist)
         else:
-            leftx_base = w // 4
+            leftx_base = None
             
-        if np.max(right_hist) > min_hist_thresh:
+        if right_found:
             rightx_base = np.argmax(right_hist) + midpoint
         else:
-            rightx_base = w * 3 // 4
+            rightx_base = None
+
+        if left_found and not right_found:
+            rightx_base = leftx_base + expected_lane_width
+        elif right_found and not left_found:
+            leftx_base = rightx_base - expected_lane_width
+        elif not left_found and not right_found:
+            if self.prev_leftx_base is not None and self.prev_rightx_base is not None:
+                leftx_base = self.prev_leftx_base
+                rightx_base = self.prev_rightx_base
+            else: 
+                leftx_base = w // 4
+                rightx_base = w * 3 // 4
 
         nwindows = 10
         window_height = int(h / nwindows)
@@ -171,6 +195,7 @@ class LanePerceptionNode(Node):
             win_y_low = h - (window + 1) * window_height
             win_y_high = h - window * window_height
             
+            # 1차 탐색
             win_xleft_low, win_xleft_high = leftx_current - margin, leftx_current + margin
             win_xright_low, win_xright_high = rightx_current - margin, rightx_current + margin
 
@@ -178,6 +203,17 @@ class LanePerceptionNode(Node):
                               (nonzerox >= win_xleft_low) & (nonzerox < win_xleft_high)).nonzero()[0]
             good_right_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) & 
                                (nonzerox >= win_xright_low) & (nonzerox < win_xright_high)).nonzero()[0]
+            
+            # --- [2. 동적 마진 (Dynamic Margin) 적용] ---
+            if len(good_left_inds) < minpix:
+                win_xleft_low, win_xleft_high = leftx_current - dynamic_margin, leftx_current + dynamic_margin
+                good_left_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) & 
+                                  (nonzerox >= win_xleft_low) & (nonzerox < win_xleft_high)).nonzero()[0]
+                                  
+            if len(good_right_inds) < minpix:
+                win_xright_low, win_xright_high = rightx_current - dynamic_margin, rightx_current + dynamic_margin
+                good_right_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) & 
+                                   (nonzerox >= win_xright_low) & (nonzerox < win_xright_high)).nonzero()[0]
             
             found_lane_in_window = False
 
@@ -197,14 +233,14 @@ class LanePerceptionNode(Node):
         if len(valid_center_pts) >= 3:
             pts_center = np.array(valid_center_pts)
             fit_center = np.polyfit(pts_center[:, 1], pts_center[:, 0], 2)
-            return valid_center_pts, fit_center
         elif len(valid_center_pts) == 2:
             pts_center = np.array(valid_center_pts)
             fit_1d = np.polyfit(pts_center[:, 1], pts_center[:, 0], 1)
             fit_center = np.array([0.0, fit_1d[0], fit_1d[1]])
-            return valid_center_pts, fit_center
         else:
-            return [], None
+            fit_center = None
+
+        return valid_center_pts, fit_center, leftx_base, rightx_base
 
     def image_callback(self, image_msg: Image) -> None:
         """Process one camera image and publish MPC path."""
@@ -220,12 +256,16 @@ class LanePerceptionNode(Node):
 
         img_height, img_width = img.shape[:2]
         
-        # 1. Image Processing
+        # 1. Image Processing & Lane Finding
         white_mask = self.filter_colors(img)
         warped_mask = self.warp_birdseye(white_mask)
-        valid_center_pts, raw_fit_center = self.find_lane_points(warped_mask)
+        valid_center_pts, raw_fit_center, current_leftx, current_rightx = self.find_lane_points(warped_mask)
         
-        # EMA Filtering
+        # State Update: 시작점 메모리 저장
+        self.prev_leftx_base = current_leftx
+        self.prev_rightx_base = current_rightx
+        
+        # 2. EMA Filtering for Curve Fitting
         alpha = self.get_parameter('ema_alpha').value
         if raw_fit_center is not None:
             if self.prev_fit is not None:
@@ -236,7 +276,7 @@ class LanePerceptionNode(Node):
         else:
             fit_center = self.prev_fit
             
-        # 2. State Machine Update
+        # 3. State Machine (Intersection Detection)
         is_crossroad_detected, detected_win_idx, current_turn_dir = self.detect_intersection_and_direction(
             warped_mask, fit_center
         )
@@ -272,7 +312,7 @@ class LanePerceptionNode(Node):
             else:
                 intersection_flag_value = 1.0
 
-        # 3. Path Generation
+        # 4. Path Generation
         mpc_path = []
         num_waypoints = 10
         lane_width_offset = self.get_parameter('lane_width_offset').value
@@ -305,10 +345,10 @@ class LanePerceptionNode(Node):
                     by = float((1-t)**2 * P0[1] + 2*(1-t)*t * P1_y + t**2 * P2_y)
                     mpc_path.append((bx, by))
 
-        # 4. Publish Features (Only Path Coordinates)
+        # 5. Publish Features (Only Path Coordinates)
         if mpc_path:
             features_msg = Float32MultiArray()
-            # 튜플 리스트 [(x1, y1), (x2, y2), ...]를 1차원 리스트 [x1, y1, x2, y2, ...]로 평탄화
+            # 튜플 리스트 [(x1, y1), ...]를 1차원 리스트 [x1, y1, x2, y2, ...]로 평탄화
             features_msg.data = [val for pt in mpc_path for val in pt]
             self.features_publisher.publish(features_msg)
 

@@ -17,7 +17,8 @@ from std_msgs.msg import Float32MultiArray
 class LanePerceptionNode(Node):
     """
     Camera-based lane perception node using 2nd-order curve fitting and state machine.
-    * Includes Canny edge detection, smart start points, and dynamic margin search.
+    * Includes Canny edge detection, smart start points, dynamic margin search.
+    * Publishes MPC path features in METERS relative to base_link.
     """
 
     def __init__(self) -> None:
@@ -27,16 +28,19 @@ class LanePerceptionNode(Node):
         self.declare_parameter('image_topic', '/camera/image_raw')
         self.declare_parameter('features_topic', '/lane_features')
 
-        # Tuning parameters (알고리즘 튜닝용)
+        # Tuning parameters
         self.declare_parameter('intersection_threshold', 30000)
         self.declare_parameter('ema_alpha', 0.7)
         self.declare_parameter('lane_width_offset', 250)
         self.declare_parameter('turn_end_margin', 40)
         self.declare_parameter('min_hist_thresh', 20)
-        
-        # New Tuning parameters for Robust Tracking
         self.declare_parameter('expected_lane_width', 500)
         self.declare_parameter('dynamic_margin', 150)
+
+        # 픽셀을 미터로 변환하기 위한 스케일 파라미터 (캘리브레이션 필요)
+        # 0.001은 1픽셀 당 1mm(0.001m)를 의미
+        self.declare_parameter('meters_per_pixel_x', 0.001) 
+        self.declare_parameter('meters_per_pixel_y', 0.002) 
 
         image_topic = str(self.get_parameter('image_topic').value)
         features_topic = str(self.get_parameter('features_topic').value)
@@ -49,13 +53,11 @@ class LanePerceptionNode(Node):
         self.turn_history = deque(maxlen=5)
         self.prev_fit = None
         
-        # Smart tracking memory variables
         self.prev_leftx_base = None
         self.prev_rightx_base = None
 
         self.bridge = CvBridge()
 
-        # ROS 2 Subscribers and Publishers
         self.image_subscription = self.create_subscription(
             Image,
             image_topic,
@@ -154,7 +156,6 @@ class LanePerceptionNode(Node):
         left_found = np.max(left_hist) > min_hist_thresh
         right_found = np.max(right_hist) > min_hist_thresh
 
-        # --- [1. 스마트 시작점 추정] ---
         if left_found:
             leftx_base = np.argmax(left_hist)
         else:
@@ -195,7 +196,6 @@ class LanePerceptionNode(Node):
             win_y_low = h - (window + 1) * window_height
             win_y_high = h - window * window_height
             
-            # 1차 탐색
             win_xleft_low, win_xleft_high = leftx_current - margin, leftx_current + margin
             win_xright_low, win_xright_high = rightx_current - margin, rightx_current + margin
 
@@ -204,7 +204,6 @@ class LanePerceptionNode(Node):
             good_right_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) & 
                                (nonzerox >= win_xright_low) & (nonzerox < win_xright_high)).nonzero()[0]
             
-            # --- [2. 동적 마진 (Dynamic Margin) 적용] ---
             if len(good_left_inds) < minpix:
                 win_xleft_low, win_xleft_high = leftx_current - dynamic_margin, leftx_current + dynamic_margin
                 good_left_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) & 
@@ -256,16 +255,13 @@ class LanePerceptionNode(Node):
 
         img_height, img_width = img.shape[:2]
         
-        # 1. Image Processing & Lane Finding
         white_mask = self.filter_colors(img)
         warped_mask = self.warp_birdseye(white_mask)
         valid_center_pts, raw_fit_center, current_leftx, current_rightx = self.find_lane_points(warped_mask)
         
-        # State Update: 시작점 메모리 저장
         self.prev_leftx_base = current_leftx
         self.prev_rightx_base = current_rightx
         
-        # 2. EMA Filtering for Curve Fitting
         alpha = self.get_parameter('ema_alpha').value
         if raw_fit_center is not None:
             if self.prev_fit is not None:
@@ -276,7 +272,6 @@ class LanePerceptionNode(Node):
         else:
             fit_center = self.prev_fit
             
-        # 3. State Machine (Intersection Detection)
         is_crossroad_detected, detected_win_idx, current_turn_dir = self.detect_intersection_and_direction(
             warped_mask, fit_center
         )
@@ -308,22 +303,22 @@ class LanePerceptionNode(Node):
             if is_lane_recovered and not is_crossroad_detected:
                 self.in_intersection_mode = False
                 self.turn_direction = "STRAIGHT"
-                self.get_logger().info("✅ [차선 복귀]")
+                self.get_logger().info("[차선 복귀]")
             else:
                 intersection_flag_value = 1.0
 
-        # 4. Path Generation
         mpc_path = []
         num_waypoints = 10
         lane_width_offset = self.get_parameter('lane_width_offset').value
         turn_end_margin = self.get_parameter('turn_end_margin').value
 
+        # 픽셀 단위로 경로점(Waypoint) 계산
         if intersection_flag_value == 0.0:
             if fit_center is not None:
                 y_points = np.linspace(img_height, 0, num_waypoints)
                 for y in y_points:
                     x = fit_center[0] * (y**2) + fit_center[1] * y + fit_center[2]
-                    mpc_path.append((float(x), float(y)))
+                    mpc_path.append((x, y))
         else:
             if fit_center is not None:
                 P0_y = img_height
@@ -341,15 +336,26 @@ class LanePerceptionNode(Node):
                 
                 t_values = np.linspace(0.0, 1.0, num_waypoints)
                 for t in t_values:
-                    bx = float((1-t)**2 * P0[0] + 2*(1-t)*t * P1_x + t**2 * P2_x)
-                    by = float((1-t)**2 * P0[1] + 2*(1-t)*t * P1_y + t**2 * P2_y)
+                    bx = (1-t)**2 * P0[0] + 2*(1-t)*t * P1_x + t**2 * P2_x
+                    by = (1-t)**2 * P0[1] + 2*(1-t)*t * P1_y + t**2 * P2_y
                     mpc_path.append((bx, by))
 
-        # 5. Publish Features (Only Path Coordinates)
+        # --- [수정] 5. Publish Features (Pixel -> Meter 변환 후 발행) ---
         if mpc_path:
+            m_per_pix_x = self.get_parameter('meters_per_pixel_x').value
+            m_per_pix_y = self.get_parameter('meters_per_pixel_y').value
+            
             features_msg = Float32MultiArray()
-            # 튜플 리스트 [(x1, y1), ...]를 1차원 리스트 [x1, y1, x2, y2, ...]로 평탄화
-            features_msg.data = [val for pt in mpc_path for val in pt]
+            path_in_meters = []
+            
+            for pix_x, pix_y in mpc_path:
+                # ROS base_link 좌표계 기준 (X: 로봇 전방, Y: 로봇 좌측)
+                robot_x = (img_height - pix_y) * m_per_pix_y
+                robot_y = (img_width / 2.0 - pix_x) * m_per_pix_x
+                
+                path_in_meters.extend([float(robot_x), float(robot_y)])
+                
+            features_msg.data = path_in_meters
             self.features_publisher.publish(features_msg)
 
 

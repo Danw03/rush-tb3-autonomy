@@ -1,0 +1,31 @@
+mpc_controller:
+  ros__parameters:
+    control_period: 0.1
+    horizon_steps: 20
+    linearization_iterations: 2
+
+    q: [3.0, 80.0, 15.0]
+    q_terminal: [10.0, 150.0, 30.0]
+    r: [2.0, 0.2]
+    r_delta: [4.0, 0.5]
+
+    v_min: 0.0
+    v_max: 0.06
+    omega_max: 0.8
+    acceleration_v: 0.15
+    acceleration_omega: 1.5
+    regularization: 1.0e-8
+
+    qp_max_iterations: 250
+    qp_rho: 1.0
+    qp_sigma: 1.0e-6
+    qp_eps_abs: 1.0e-4
+    qp_eps_rel: 1.0e-4
+
+    reference_speed_default: 0.03
+    input_timeout: 0.5
+
+    odom_topic: /odom
+    reference_path_topic: /reference_path
+    reference_speed_topic: /reference_speed
+    cmd_topic: /cmd_vel_raw
